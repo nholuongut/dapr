@@ -1,0 +1,19 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name: service-invocation-external
+  labels:
+    testapp: service-invocation-external
+spec:
+  selector:
+    testapp: serviceinvocation-callee-external
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 3000
+    name: http
+  - protocol: TCP
+    port: 443
+    targetPort: 3001
+    name: https
+  type: LoadBalancer

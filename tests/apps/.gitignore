@@ -1,0 +1,7 @@
+*/app
+actorapp/actorapp
+actorfeatures/actorfeatures
+stateapp/stateapp
+pubsub-subscriber-routing/pubsub-subscriber-routing
+pubsub-subscriber-routing_grpc/pubsub-subscriber-routing_grpc
+*.exe

@@ -1,0 +1,278 @@
+{{- if and (eq .Values.global.actors.enabled true) (eq .Values.global.actors.serviceName "placement") }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dapr-placement-server
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: dapr-placement-server
+    {{- range $key, $value := .Values.global.k8sLabels }}
+    {{ $key }}: {{ tpl $value $ }}
+    {{- end }}
+spec:
+{{- if eq .Values.scaleZero true }}
+  replicas: 0
+{{- else if or (eq .Values.global.ha.enabled true) (eq .Values.ha true) }}
+  replicas: 3
+{{- else }}
+  replicas: 1
+{{- end }}
+  serviceName: dapr-placement-server
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: dapr-placement-server
+  template:
+    metadata:
+      labels:
+        app: dapr-placement-server
+        {{- range $key, $value := .Values.global.k8sLabels }}
+        {{ $key }}: {{ tpl $value $ }}
+        {{- end }}
+        {{- with .Values.global.labels }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        dapr.io/control-plane: placement
+{{- if eq .Values.global.prometheus.enabled true }}
+        prometheus.io/scrape: "{{ .Values.global.prometheus.enabled }}"
+        prometheus.io/port: "{{ .Values.global.prometheus.port }}"
+        prometheus.io/path: "/"
+{{- end }}
+{{- with .Values.statefulsetAnnotations }}
+{{ toYaml . | indent 8 }}
+{{- end }}
+    spec:
+      containers:
+      - name: dapr-placement-server
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+{{- if eq .Values.debug.enabled false }}
+          initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+{{- else }}
+          initialDelaySeconds: {{ .Values.debug.initialDelaySeconds }}
+{{- end }}
+          periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+          failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+{{- if eq .Values.debug.enabled false }}
+          initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+{{- else }}
+          initialDelaySeconds: {{ .Values.debug.initialDelaySeconds }}
+{{- end }}
+          periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+          failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+{{- if contains "/" .Values.image.name }}
+        image: "{{ .Values.image.name }}"
+{{- else }}
+        image: "{{ .Values.global.registry }}/{{ .Values.image.name }}:{{ .Values.global.tag }}"
+{{- end }}
+        imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+        resources:
+{{ toYaml .Values.resources | indent 10 }}
+        volumeMounts:
+          - name: dapr-trust-bundle
+            mountPath: /var/run/secrets/dapr.io/tls
+            readOnly: true
+        {{- if .Values.global.mtls.mountSentryVolume }}
+          - name: dapr-identity-token
+            mountPath: /var/run/secrets/dapr.io/sentrytoken
+        {{- end }}
+        {{- with .Values.global.extraVolumeMounts.placement }}
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+{{- if or (eq .Values.global.ha.enabled true) (eq .Values.ha true) }}
+  {{- if eq .Values.cluster.forceInMemoryLog false }}
+          - name: raft-log
+    {{- if eq .Values.global.daprControlPlaneOs "windows" }}
+            mountPath: {{ .Values.cluster.logStoreWinPath }}
+    {{- else }}
+            mountPath: {{ .Values.cluster.logStorePath }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+        ports:
+          - containerPort: {{ .Values.ports.apiPort }}
+            name: api
+          - containerPort: {{ .Values.ports.raftRPCPort }}
+            name: raft-node
+{{- if eq .Values.global.prometheus.enabled true }}
+          - name: metrics
+            containerPort: {{ .Values.global.prometheus.port }}
+            protocol: TCP
+{{- end }}
+        command:
+{{- if eq .Values.debug.enabled false }}
+        - "/placement"
+{{- else }}
+        - "/dlv"
+{{- end }}
+        args:
+{{- if eq .Values.debug.enabled true }}
+        - "--listen=:{{ .Values.debug.port }}"
+        - "--accept-multiclient"
+        - "--headless=true"
+        - "--log"
+        - "--api-version=2"
+        - "exec"
+        - "/placement"
+        - "--"
+{{- end }}
+{{- if or (eq .Values.global.ha.enabled true) (eq .Values.ha true) }}
+        - "--id"
+        - "$(PLACEMENT_ID)"
+        - "--initial-cluster"
+        - {{ template "dapr_placement.initialcluster" . }}
+  {{- if eq .Values.cluster.forceInMemoryLog false }}
+        - "--raft-logstore-path"
+    {{- if eq .Values.global.daprControlPlaneOs "windows" }}
+        - "{{ .Values.cluster.logStoreWinPath }}\\cluster-v2-$(PLACEMENT_ID)"
+    {{- else }}
+        - "{{ .Values.cluster.logStorePath }}/cluster-v2-$(PLACEMENT_ID)"
+    {{- end }}
+  {{- end }}
+{{- end }}
+        - "--log-level"
+        - {{ .Values.logLevel }}
+{{- if eq .Values.global.logAsJson true }}
+        - "--log-as-json"
+{{- end }}
+{{- if eq .Values.metadataEnabled true }}
+        - "--metadata-enabled"
+{{- end }}
+        - "--replicationFactor={{ .Values.replicationFactor }}"
+        - "--max-api-level={{ .Values.maxActorApiLevel }}"
+        - "--min-api-level={{ .Values.minActorApiLevel }}"
+        - "--keepalive-time={{ .Values.keepAliveTime }}"
+        - "--keepalive-timeout={{ .Values.keepAliveTimeout }}"
+        - "--disseminate-timeout={{ .Values.disseminateTimeout }}"
+{{- if eq .Values.global.prometheus.enabled true }}
+        - "--enable-metrics"
+        - "--metrics-port"
+        - "{{ .Values.global.prometheus.port }}"
+{{- else }}
+        - "--enable-metrics=false"
+{{- end }}
+        - "--tls-enabled"
+        - "--trust-domain={{ .Values.global.mtls.controlPlaneTrustDomain }}"
+        - "--trust-anchors-file=/var/run/secrets/dapr.io/tls/ca.crt"
+        - "--sentry-address={{ if .Values.global.mtls.sentryAddress }}{{ .Values.global.mtls.sentryAddress }}{{ else }}dapr-sentry.{{ .Release.Namespace }}.svc.cluster.local:443{{ end }}"
+        - "--mode=kubernetes"
+{{- if eq .Values.global.daprControlPlaneOs "linux" }}
+        securityContext:
+{{- if eq .Values.cluster.forceInMemoryLog true }}
+          runAsNonRoot: {{ .Values.runAsNonRoot }}
+{{- else }}
+          runAsUser: 0
+{{- end }}
+  {{- if eq .Values.debug.enabled true }}
+          capabilities:
+            add: ["SYS_PTRACE"]
+  {{- else }}
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+  {{- end }}
+  {{- if .Values.global.seccompProfile }}
+          seccompProfile:
+            type: {{ .Values.global.seccompProfile }}
+  {{- end }}
+{{- end }}
+        env:
+        - name: PLACEMENT_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        {{- range $name, $value := .Values.extraEnvVars }}
+        - name: "{{ $name }}"
+          value: "{{ $value }}"
+        {{- end }}
+      serviceAccountName: dapr-placement
+      volumes:
+      - name: dapr-trust-bundle
+        configMap:
+          name: dapr-trust-bundle
+    {{- if .Values.global.mtls.mountSentryVolume }}
+      - name: dapr-identity-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: token
+              expirationSeconds: 600
+              audience: "spiffe://{{ .Values.global.mtls.controlPlaneTrustDomain }}/ns/{{ .Release.Namespace }}/dapr-sentry"
+    {{- end }}
+    {{- with .Values.global.extraVolumes.placement }}
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+             nodeSelectorTerms:
+                - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values:
+                    - {{ .Values.global.daprControlPlaneOs }}
+{{- if .Values.global.daprControlPlaneArch }}
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                    - {{ .Values.global.daprControlPlaneArch }}
+{{- end }}
+{{- if .Values.global.ha.enabled }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - dapr-placement-server
+              topologyKey: topology.kubernetes.io/zone
+{{- end }}
+{{- if .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- include "dapr.imagePullSecrets" (dict "imagePullSecrets" .Values.global.imagePullSecrets) | nindent 8 -}}
+{{- end }}
+{{- if .Values.global.nodeSelector }}
+      nodeSelector:
+{{ toYaml .Values.global.nodeSelector | indent 8 }}
+{{- end }}
+{{- if .Values.global.tolerations }}
+      tolerations:
+{{ toYaml .Values.global.tolerations | indent 8 }}
+{{- end }}
+{{- if .Values.global.priorityClassName }}
+      priorityClassName:
+{{ toYaml .Values.global.priorityClassName | indent 8 }}
+{{- end }}
+{{- if or (eq .Values.global.ha.enabled true) (eq .Values.ha true) }}
+  {{- if eq .Values.cluster.forceInMemoryLog false }}
+  volumeClaimTemplates:
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: raft-log
+    spec:
+      accessModes:
+        - ReadWriteOnce
+      resources:
+        requests:
+          storage: {{ .Values.volumeclaims.storageSize }}
+    {{- if .Values.volumeclaims.storageClassName }}
+      storageClassName: {{ .Values.volumeclaims.storageClassName }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,312 @@
+#
+# Copyright 2021 The Dapr Authors
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: E2E tests on KinD
+
+on:
+  # Manual trigger
+  workflow_dispatch:
+  # On pull requests
+  pull_request:
+    branches:
+      - master
+      - 'release-*'
+      - 'feature/*'
+
+defaults:
+  run:
+    shell: bash
+
+permissions: {}
+
+jobs:
+  # This workflow runs our e2e tests in a local KinD cluster. Since it
+  # does not required a paid cluster and special credentials, it does
+  # not require /ok-to-test. That allows contributors to run E2E tests
+  # in their Draft PRs without explicit approval from Dapr
+  # maintainers.
+  #
+  # One other benefit of a fully-localized workflow is that tests are
+  # running on a fresh cluster everytime, thus being decoupled from
+  # shared resource issues.
+  #
+  # However, KinD currently does not support Windows nodes so this is
+  # not intended to be a complete replacement for our AKS-based E2E
+  # workflows.
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      REGISTRY_PORT: 5000
+      REGISTRY_NAME: kind-registry
+      DAPR_REGISTRY: localhost:5000/dapr
+      DAPR_TAG: dev
+      DAPR_NAMESPACE: dapr-tests
+      # Useful for upgrade/downgrade/compatibility tests
+      # TODO: Make this auto-populated based on GitHub's releases.
+      DAPR_TEST_N_MINUS_1_IMAGE: "ghcr.io/nholuongut/daprd:1.13.0"
+      DAPR_TEST_N_MINUS_2_IMAGE: "ghcr.io/nholuongut/daprd:1.12.5"
+      # Container registry where to cache e2e test images
+      DAPR_CACHE_REGISTRY: "dapre2eacr.azurecr.io"
+      PULL_POLICY: IfNotPresent
+      DAPR_GO_BUILD_TAGS: wfbackendsqlite
+    strategy:
+      fail-fast: false # Keep running if one leg fails.
+      matrix:
+        k8s-version:
+        - v1.31.0
+        - v1.30.4
+        - v1.29.8
+        mode:
+        - ha
+        - non-ha
+        # Map between K8s and KinD versions.
+        # This is attempting to make it a bit clearer what's being tested.
+        # See: https://github.com/kubernetes-sigs/kind/releases/tag/v0.11.1
+        include:
+        - k8s-version: v1.31.0
+          kind-version: v0.24.0
+          kind-image-sha: sha256:53df588e04085fd41ae12de0c3fe4c72f7013bba32a20e7325357a1ac94ba865
+          dapr-test-config-store: "postgres"
+        - k8s-version: v1.30.4
+          kind-version: v0.24.0
+          kind-image-sha: sha256:976ea815844d5fa93be213437e3ff5754cd599b040946b5cca43ca45c2047114
+          dapr-test-config-store: "redis"
+        - k8s-version: v1.29.8
+          kind-version: v0.24.0
+          kind-image-sha: sha256:d46b7aa29567e93b27f7531d258c372e829d7224b25e3fc6ffdefed12476d3aa
+          dapr-test-config-store: "redis"
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+    - name: Set up Go
+      id: setup-go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: 'go.mod'
+    - name: Configure KinD
+      # Generate a KinD configuration file that uses:
+      # (a) a couple of worker nodes: this is needed to run both
+      #     ZooKeeper + Kakfa, and
+      # (b) a local registry: Due to `kind load` performance
+      #     https://github.com/kubernetes-sigs/kind/issues/1165, using
+      #     a local repository speeds up the image pushes into KinD
+      #     significantly.
+      run: |
+        cat > kind.yaml <<EOF
+        apiVersion: kind.x-k8s.io/v1alpha4
+        kind: Cluster
+        nodes:
+        - role: control-plane
+          image: kindest/node:${{ matrix.k8s-version }}@${{ matrix.kind-image-sha }}
+        - role: worker
+          image: kindest/node:${{ matrix.k8s-version }}@${{ matrix.kind-image-sha }}
+        - role: worker
+          image: kindest/node:${{ matrix.k8s-version }}@${{ matrix.kind-image-sha }}
+        - role: worker
+          image: kindest/node:${{ matrix.k8s-version }}@${{ matrix.kind-image-sha }}
+        containerdConfigPatches:
+        - |-
+          [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:$REGISTRY_PORT"]
+            endpoint = ["http://$REGISTRY_NAME:$REGISTRY_PORT"]
+        EOF
+
+        # Log the generated kind.yaml for easy reference.
+        cat kind.yaml
+
+        # Set log target directories
+        echo "DAPR_CONTAINER_LOG_PATH=$GITHUB_WORKSPACE/container_logs/${{ matrix.k8s-version }}_${{ matrix.mode }}" >> $GITHUB_ENV
+        echo "DAPR_TEST_LOG_PATH=$GITHUB_WORKSPACE/test_logs/${{ matrix.k8s-version }}_${{ matrix.mode }}" >> $GITHUB_ENV
+
+    - name: Create KinD Cluster
+      uses: helm/kind-action@v1.10.0
+      with:
+        config: kind.yaml
+        cluster_name: kind
+        version: ${{ matrix.kind-version }}
+
+    - name: Get KinD info
+      run: |
+        kubectl cluster-info --context kind-kind
+        NODE_IP=$(kubectl get nodes \
+                  -lkubernetes.io/hostname!=kind-control-plane \
+                  -ojsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+        echo "MINIKUBE_NODE_IP=$NODE_IP" >> $GITHUB_ENV
+
+    - name: Setup test output
+      shell: bash
+      run: |
+        export TEST_OUTPUT_FILE_PREFIX=$GITHUB_WORKSPACE/test_report
+        echo "TEST_OUTPUT_FILE_PREFIX=$TEST_OUTPUT_FILE_PREFIX" >> $GITHUB_ENV
+
+    - name: Setup local registry
+      run: |
+        # Run a registry.
+        docker run -d --restart=always \
+          -p $REGISTRY_PORT:$REGISTRY_PORT --name $REGISTRY_NAME registry:2
+        # Connect the registry to the KinD network.
+        docker network connect "kind" $REGISTRY_NAME
+
+    - name: Setup Helm
+      uses: azure/setup-helm@v1
+      with:
+        version: v3.3.4
+
+    - name: Build and push Dapr
+      run: |
+        make build-linux
+        make docker-build
+        make docker-push
+
+    - name: Build and push test apps
+      run: |
+        make build-push-e2e-app-all
+
+    - name: Setup Dapr
+      run: |
+        make setup-helm-init
+        make create-test-namespace
+        export ADDITIONAL_HELM_SET="dapr_operator.logLevel=debug,dapr_operator.watchInterval=20s"
+        if [[ "${{ matrix.mode }}" == "ha" ]]; then
+          export HA_MODE=true
+        else
+          export HA_MODE=false
+        fi
+        make docker-deploy-k8s
+
+    - name: Setup Redis
+      run: |
+        make setup-test-env-redis
+
+    - name: Setup Kafka
+      run: |
+        make setup-test-env-kafka
+
+    - name: Setup Zipkin
+      run: |
+        make setup-test-env-zipkin
+
+    - name: Setup postgres
+      run: |
+        make setup-test-env-postgres
+
+    - name: Setup test components
+      run: |
+        make setup-test-components
+      env:
+        DAPR_TEST_CONFIG_STORE: ${{ matrix.dapr-test-config-store }}
+
+    - name: Free up some diskspace
+      run: |
+        docker image prune -a -f
+        # Clean up some more
+        echo "Listing 100 largest packages"
+        dpkg-query -Wf '${Installed-Size}\t${Package}\n' | sort -n | tail -n 100
+        df -h
+        echo "Removing large packages"
+        sudo apt-get update
+        
+        # check if pkgs exist before removing them
+        if dpkg -l | grep -q '^dotnet-.*'; then
+          sudo apt-get remove -y '^dotnet-.*'
+        fi
+
+        if dpkg -l | grep -q '^llvm-.*'; then
+          sudo apt-get remove -y '^llvm-.*'
+        fi
+        
+        if dpkg -l | grep -q 'php.*'; then
+          sudo apt-get remove -y 'php.*'
+        fi
+        
+        if dpkg -l | grep -q 'temurin-*'; then
+          sudo apt-get remove -y 'temurin-*'
+        fi
+        
+        if dpkg -l | grep -q 'microsoft-edge-stable'; then
+          sudo apt-get remove -y microsoft-edge-stable
+        fi
+    
+        if dpkg -l | grep -q 'azure-cli'; then
+          sudo apt-get remove -y azure-cli
+        fi
+    
+        if dpkg -l | grep -q 'google-chrome-stable'; then
+          sudo apt-get remove -y google-chrome-stable
+        fi
+    
+        if dpkg -l | grep -q 'firefox'; then
+          sudo apt-get remove -y firefox
+        fi
+        
+        if dpkg -l | grep -q '^powershell'; then
+          sudo apt-get remove -y powershell
+        fi
+    
+        if dpkg -l | grep -q 'mono-devel'; then
+          sudo apt-get remove -y mono-devel
+        fi
+        
+        sudo apt-get autoremove -y
+        sudo apt-get clean
+        df -h
+        
+        echo "Removing large directories"
+        # deleting 15GB
+        rm -rf /usr/share/dotnet/
+        df -h
+
+    - name: Run tests
+      run: |
+        make test-e2e-all
+      env:
+        DAPR_TEST_CONFIG_STORE: ${{ matrix.dapr-test-config-store }}
+
+    - name: Save control plane logs
+      if: always()
+      run: |
+        make save-dapr-control-plane-k8s-logs
+
+    # Container log files can be bigger than the maximum file size allowed by GitHub
+    - name: Compress logs
+      if: always()
+      run: |
+        gzip --fast -r ${{ env.DAPR_CONTAINER_LOG_PATH }}
+        gzip --fast -r ${{ env.DAPR_TEST_LOG_PATH }}
+      shell: bash
+
+    - name: Upload container logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.k8s-version }}_${{ matrix.mode}}_container_logs
+        path: ${{ env.DAPR_CONTAINER_LOG_PATH }}
+        compression-level: 0 # Content is already compressed
+
+    - name: Upload test logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.k8s-version }}_${{ matrix.mode}}_test_logs
+        path: ${{ env.DAPR_TEST_LOG_PATH }}
+        compression-level: 0 # Content is already compressed
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        #TODO: .json suffix can be removed from artifact name after test analytics scripts are updated
+        name: ${{ matrix.k8s-version }}_${{ matrix.mode }}_test_e2e.json
+        path: ${{ env.TEST_OUTPUT_FILE_PREFIX }}_e2e.*

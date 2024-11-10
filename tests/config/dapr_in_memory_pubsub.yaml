@@ -1,0 +1,15 @@
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: inmemorypubsub
+spec:
+  type: pubsub.in-memory
+  version: v1
+  initTimeout: 1m
+  metadata: []
+scopes:
+  - pubsub-perf-bulk-grpc
+  - pubsub-perf-grpc
+  - healthapp-http
+  - healthapp-grpc
+  - healthapp-h2c

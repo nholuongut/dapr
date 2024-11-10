@@ -1,0 +1,37 @@
+{{- if eq .Values.enabled true }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: dapr-sidecar-injector
+  labels:
+    app: dapr-sidecar-injector
+    {{- range $key, $value := .Values.global.k8sLabels }}
+    {{ $key }}: {{ tpl $value $ }}
+    {{- end }}
+webhooks:
+- name: sidecar-injector.dapr.io
+  reinvocationPolicy: IfNeeded
+  clientConfig:
+    service:
+      namespace: {{ .Release.Namespace }}
+      name: dapr-sidecar-injector
+      path: "/mutate"
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    resources:
+    - pods
+    operations:
+    - CREATE
+  failurePolicy: {{ .Values.webhookFailurePolicy}}
+  sideEffects: None
+  admissionReviewVersions: ["v1", "v1beta1"]
+  {{- if .Values.namespaceSelector }}
+  namespaceSelector: {{- .Values.namespaceSelector | toYaml | nindent 4 }}
+  {{- end }}
+  {{- if .Values.objectSelector }}
+  objectSelector: {{- .Values.objectSelector | toYaml | nindent 4 }}
+  {{- end }}
+{{- end }}

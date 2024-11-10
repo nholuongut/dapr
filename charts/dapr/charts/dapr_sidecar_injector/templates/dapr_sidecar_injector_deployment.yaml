@@ -1,0 +1,294 @@
+{{- if eq .Values.enabled true }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dapr-sidecar-injector
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: dapr-sidecar-injector
+    {{- range $key, $value := .Values.global.k8sLabels }}
+    {{ $key }}: {{ tpl $value $ }}
+    {{- end }}
+spec:
+{{- if eq .Values.global.ha.enabled true }}
+  replicas: {{ .Values.global.ha.replicaCount }}
+{{- else }}
+  replicas: {{ .Values.replicaCount }}  
+{{- end }}
+  selector:
+    matchLabels:
+      app: dapr-sidecar-injector
+  template:
+    metadata:
+      labels:
+        app: dapr-sidecar-injector
+        {{- range $key, $value := .Values.global.k8sLabels }}
+        {{ $key }}: {{ tpl $value $ }}
+        {{- end }}
+        {{- with .Values.global.labels }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        dapr.io/control-plane: injector
+{{- if eq .Values.global.prometheus.enabled true }}
+        prometheus.io/scrape: "{{ .Values.global.prometheus.enabled }}"
+        prometheus.io/port: "{{ .Values.global.prometheus.port }}"
+        prometheus.io/path: "/"
+{{- end }}
+{{- with .Values.deploymentAnnotations }}
+{{ toYaml . | indent 8 }}
+{{- end }}
+    spec:
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      {{- end }}
+      serviceAccountName: dapr-injector
+      containers:
+      - name: dapr-sidecar-injector
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: {{ .Values.healthzPort }}
+          {{- if eq .Values.debug.enabled false }}
+          initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+          {{- else }}
+          initialDelaySeconds: {{ .Values.debug.initialDelaySeconds }}
+          {{- end }}
+          periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+          failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: {{ .Values.healthzPort }}
+          {{- if eq .Values.debug.enabled false }}
+          initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+          {{- else }}
+          initialDelaySeconds: {{ .Values.debug.initialDelaySeconds }}
+          {{- end }}
+          periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+          failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+{{- if contains "/" .Values.injectorImage.name }}
+        image: "{{ .Values.injectorImage.name }}"
+{{- else }}
+        image: "{{ .Values.global.registry }}/{{ .Values.injectorImage.name }}:{{ .Values.global.tag }}"
+{{- end }}
+        imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+{{- if eq .Values.global.daprControlPlaneOs "linux" }}
+        securityContext:
+  {{- if eq .Values.runAsNonRoot true }}
+          runAsNonRoot: {{ .Values.runAsNonRoot }}
+  {{- else }}
+          runAsUser: 1000
+  {{- end }}
+  {{- if eq .Values.debug.enabled true }}
+          capabilities:
+            add: ["SYS_PTRACE"]
+  {{- else }}
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+  {{- end }}
+  {{- if .Values.global.seccompProfile }}
+          seccompProfile:
+            type: {{ .Values.global.seccompProfile }}
+  {{- end }}
+{{- end }}
+        command:
+{{- if eq .Values.debug.enabled false }}
+        - "/injector"
+{{- else }}
+        - "/dlv"
+{{- end }}
+        args:
+{{- if eq .Values.debug.enabled true }}
+        - "--listen=:{{ .Values.debug.port }}"
+        - "--accept-multiclient"
+        - "--headless=true"
+        - "--log"
+        - "--api-version=2"
+        - "exec"
+        - "/injector"
+        - "--"
+{{- end }}
+        - "--log-level"
+        - {{ .Values.logLevel }}
+{{- if eq .Values.global.logAsJson true }}
+        - "--log-as-json"
+{{- end }}
+{{- if eq .Values.global.prometheus.enabled true }}
+        - "--enable-metrics"
+        - "--metrics-port"
+        - "{{ .Values.global.prometheus.port }}"
+{{- else }}
+        - "--enable-metrics=false"
+{{- end }}
+        - "--healthz-port"
+        - {{ .Values.healthzPort | toString | toYaml }}
+        env:
+        - name: DAPR_TRUST_ANCHORS_FILE
+          value: /var/run/secrets/dapr.io/tls/ca.crt
+        - name: DAPR_CONTROL_PLANE_TRUST_DOMAIN
+          value: {{ .Values.global.mtls.controlPlaneTrustDomain | toYaml }}
+        - name: DAPR_SENTRY_ADDRESS
+          value: {{ with .Values.global.mtls.sentryAddress }}{{ . }}{{ else }}dapr-sentry.{{ .Release.Namespace }}.svc.cluster.local:443{{ end }}
+        {{- range $name, $value := .Values.extraEnvVars }}
+        - name: {{ $name | toYaml }}
+          value: {{ $value | toString | toYaml }}
+        {{- end }}
+{{- if .Values.kubeClusterDomain }}
+        - name: KUBE_CLUSTER_DOMAIN
+          value: {{ .Values.kubeClusterDomain | toYaml }}
+{{- end }}
+        - name: SIDECAR_IMAGE
+{{- if contains "/" .Values.image.name }}
+          value: {{ .Values.image.name | toYaml }}
+{{- else }}
+          value: "{{ .Values.global.registry }}/{{ .Values.image.name }}:{{ .Values.global.tag }}"
+{{- end }}
+        - name: SIDECAR_IMAGE_PULL_POLICY
+          value: {{ .Values.sidecarImagePullPolicy | toYaml }}
+        # Configuration for injected sidecars
+        - name: SIDECAR_RUN_AS_NON_ROOT
+          value: {{ .Values.sidecarRunAsNonRoot | toString | toYaml }}
+{{- if and (.Values.sidecarRunAsUser) (gt (.Values.sidecarRunAsUser | int) 0) }}
+        - name: SIDECAR_RUN_AS_USER
+          value: {{ .Values.sidecarRunAsUser | toString | toYaml }}
+{{- end }}
+{{- if and (eq .Values.sidecarRunAsNonRoot false) (ne (.Values.sidecarRunAsUser | int) 0) }}
+{{- fail "sidecarRunAsUser must be 0 or value ommited when sidecarRunAsNonRoot is false"  }}
+{{- end }}
+{{- if and (eq .Values.sidecarRunAsNonRoot true) (and (hasKey .Values "sidecarRunAsUser") (le (.Values.sidecarRunAsUser | int) 0)) }}
+{{- fail "sidecarRunAsUser must positive when sidecarRunAsNonRoot is true (or default)"  }}
+{{- end }}
+{{- if and (.Values.sidecarRunAsGroup) (gt (.Values.sidecarRunAsGroup | int) 0) }}
+        - name: SIDECAR_RUN_AS_GROUP
+          value: {{ .Values.sidecarRunAsGroup | toString | toYaml }}
+{{- end }}
+        - name: ENABLE_K8S_DOWNWARD_APIS
+          value: {{ .Values.enableK8sDownwardAPIs | toString | toYaml }}
+        - name: SIDECAR_DROP_ALL_CAPABILITIES
+          value: {{ .Values.sidecarDropALLCapabilities | toString | toYaml }}
+        - name: SIDECAR_READ_ONLY_ROOT_FILESYSTEM
+          value: {{ .Values.sidecarReadOnlyRootFilesystem | toString | toYaml }}
+
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+
+{{- if .Values.ignoreEntrypointTolerations }}
+        - name: IGNORE_ENTRYPOINT_TOLERATIONS
+          value: {{ .Values.ignoreEntrypointTolerations | toYaml }}
+{{- end }}
+
+        # Configuration for actors and reminders
+        - name: ACTORS_ENABLED
+          value: {{ .Values.global.actors.enabled | toString | toYaml }}
+        - name: ACTORS_SERVICE_NAME
+          value: {{ .Values.global.actors.serviceName | toString | toYaml }}
+        - name: ACTORS_SERVICE_ADDRESS
+          value: {{ include (print "address." .Values.global.actors.serviceName) . | toString | toYaml }}
+{{- with .Values.global.reminders.serviceName }}
+        - name: REMINDERS_SERVICE_NAME
+          value: {{ . | toString | toYaml }}
+        - name: REMINDERS_SERVICE_ADDRESS
+          value: {{ include (print "address." .) . | toString | toYaml }}
+{{- end }}
+
+{{- if .Values.allowedServiceAccounts }}
+        - name: ALLOWED_SERVICE_ACCOUNTS
+          value: {{ .Values.allowedServiceAccounts | toYaml }}
+{{- end }}
+{{- if .Values.allowedServiceAccountsPrefixNames }}
+        - name: ALLOWED_SERVICE_ACCOUNTS_PREFIX_NAMES
+          value: {{ .Values.allowedServiceAccountsPrefixNames | toYaml }}
+{{- end }}
+        ports:
+        - name: https
+          containerPort: 4000
+          protocol: TCP
+{{- if eq .Values.global.prometheus.enabled true }}
+        - name: metrics
+          containerPort: {{ .Values.global.prometheus.port }}
+          protocol: TCP
+{{- end }}
+{{- if eq .Values.debug.enabled true }}
+        - name: debug
+          containerPort: {{ .Values.debug.port }}
+          protocol: TCP
+{{- end }}
+        resources:
+{{ toYaml .Values.resources | indent 10 }}
+        volumeMounts:
+        - name: dapr-trust-bundle
+          mountPath: /var/run/secrets/dapr.io/tls
+          readOnly: true
+      {{- if .Values.global.mtls.mountSentryVolume }}
+        - name: dapr-identity-token
+          mountPath: /var/run/secrets/dapr.io/sentrytoken
+          readOnly: true
+      {{- end }}
+      {{- with .Values.global.extraVolumeMounts.injector }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+      - name: dapr-trust-bundle
+        configMap:
+          name: dapr-trust-bundle
+    {{- if .Values.global.mtls.mountSentryVolume }}
+      - name: dapr-identity-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: token
+              expirationSeconds: 600
+              audience: "spiffe://{{ .Values.global.mtls.controlPlaneTrustDomain }}/ns/{{ .Release.Namespace }}/dapr-sentry"
+    {{- end }}
+      {{- with .Values.global.extraVolumes.injector }}
+        {{- toYaml . | nindent 6 }}
+      {{- end }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+             nodeSelectorTerms:
+                - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values:
+                      - {{ .Values.global.daprControlPlaneOs }}
+{{- if .Values.global.daprControlPlaneArch }}
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                      - {{ .Values.global.daprControlPlaneArch }}
+{{- end }}
+{{- if .Values.global.ha.enabled }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - dapr-sidecar-injector
+              topologyKey: topology.kubernetes.io/zone
+{{- end }}
+{{- if .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+{{- include "dapr.imagePullSecrets" (dict "imagePullSecrets" .Values.global.imagePullSecrets) | nindent 8 -}}
+{{- end }}
+{{- if .Values.global.nodeSelector }}
+      nodeSelector:
+{{ toYaml .Values.global.nodeSelector | indent 8 }}
+{{- end }}
+{{- if .Values.global.tolerations }}
+      tolerations:
+{{ toYaml .Values.global.tolerations | indent 8 }}
+{{- end }}
+{{- if .Values.global.priorityClassName }}
+      priorityClassName:
+{{ toYaml .Values.global.priorityClassName | indent 8 }}
+{{- end }}
+{{- end }}
